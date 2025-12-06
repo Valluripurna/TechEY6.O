@@ -9,6 +9,9 @@ from typing import List, Dict, Any, Callable, Optional
 import collections
 import os
 
+# Import image search functionality
+from data_sources import gemini_websearch
+
 # Resolve a stable output directory under the project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "reports_output")
@@ -253,6 +256,16 @@ def generate_pdf_report(query, data, filename=None):
         f"innovation and commercial interest in this therapeutic area."
     )
     _pdf_add_text(pdf, summary_para)
+    
+    # Add an image related to the query if available
+    try:
+        image_results = gemini_websearch.search_images(f"{query} medical research diagram", num_results=1)
+        if image_results and len(image_results) > 0:
+            image_url = image_results[0].get('link')
+            if image_url:
+                _pdf_add_image(pdf, image_url, width=150)
+    except Exception as e:
+        print(f"Failed to add summary image: {e}")
 
     # Key Findings (dynamic counts)
     patents_key = next((k for k in data.keys() if k.lower().startswith('patent')), None)
@@ -275,10 +288,28 @@ def generate_pdf_report(query, data, filename=None):
 
     # Data Analysis header
     _pdf_add_section(pdf, "Data Analysis")
-    _pdf_add_text(pdf, "Detailed sections follow with tables and charts where applicable.")
+    _pdf_add_text(pdf, "Detailed sections follow with tables, charts, and relevant images where applicable.")
     
     for section, content in data.items():
         _pdf_add_section(pdf, section)
+        
+        # Add an image related to this section
+        try:
+            image_query = f"{query} {section} medical illustration"
+            if 'patent' in section.lower():
+                image_query = f"{query} patent research diagram"
+            elif 'trial' in section.lower():
+                image_query = f"{query} clinical trial process"
+            elif 'exim' in section.lower():
+                image_query = f"{query} trade data visualization"
+            
+            image_results = gemini_websearch.search_images(image_query, num_results=1)
+            if image_results and len(image_results) > 0:
+                image_url = image_results[0].get('link')
+                if image_url:
+                    _pdf_add_image(pdf, image_url, width=130)
+        except Exception as e:
+            print(f"Failed to add section image for {section}: {e}")
         
         if isinstance(content, list) and content:
             # Use table for list of dicts; if nested dict values, flatten for readability
@@ -339,6 +370,16 @@ def generate_excel_report(query, data, filename=None):
     filepath = os.path.join(OUTPUT_DIR, filename)
     
     with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+        # Add a cover sheet with report information
+        cover_data = {
+            'Report Title': [f"Pharma Research Report: {str(query or '').strip() or 'Pharmaceutical'}"],
+            'Generated On': [datetime.now().strftime("%B %d, %Y at %H:%M")],
+            'Sections': [len(data)],
+        }
+        cover_df = pd.DataFrame(cover_data)
+        cover_df.to_excel(writer, sheet_name='Report Info', index=False)
+        
+        # Process each section
         for section, content in data.items():
             sheet = section[:31] if section else 'Sheet'
             if isinstance(content, list) and content:
@@ -371,12 +412,31 @@ def generate_excel_report(query, data, filename=None):
                 df = pd.DataFrame([flat])
             else:
                 df = pd.DataFrame([{"value": content}])
-            # Limit columns for readability
-            df = df[[c for c in df.columns][:20]]
-            df.to_excel(writer, sheet_name=sheet, index=False)
-    title_line = f"Pharma Research Report: {str(query or '').strip() or 'Pharmaceutical'}"
-    ts = datetime.now().strftime("Generated on: %B %d, %Y at %H:%M")
-
+            
+            # Apply formatting to improve readability
+            if not df.empty:
+                # Limit columns for readability
+                df = df.iloc[:, :20]  # Limit to first 20 columns
+                
+                # Write to Excel with formatting
+                df.to_excel(writer, sheet_name=sheet, index=False)
+                
+                # Get the worksheet to apply formatting
+                worksheet = writer.sheets[sheet]
+                
+                # Auto-adjust column widths
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)  # Max width of 50
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            
     return filepath
 
 def generate_text_summary(query, data):

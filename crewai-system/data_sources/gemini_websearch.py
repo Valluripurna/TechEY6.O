@@ -79,6 +79,75 @@ def search_with_gemini(query, num_results=5):
         # Return mock data as fallback
         return get_mock_web_results(query, num_results)
 
+def search_images(query, num_results=5):
+    """
+    Perform image search using Google Custom Search API
+    
+    Args:
+        query (str): Image search query
+        num_results (int): Number of results to return
+        
+    Returns:
+        list: List of image search results with URLs
+    """
+    try:
+        # Get API key
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        
+        if not api_key:
+            print("Google API key not found for image search, returning mock data")
+            return get_mock_image_results(query, num_results)
+        
+        # Get CSE ID
+        cse_id = os.environ.get("GOOGLE_CSE_ID")
+        
+        # If we don't have a valid CSE ID, return mock data
+        if not cse_id or cse_id == "your_google_custom_search_id":
+            print("Google Custom Search Engine ID not configured for image search, returning mock data")
+            return get_mock_image_results(query, num_results)
+        
+        # Google Custom Search API endpoint for image search
+        url = "https://www.googleapis.com/customsearch/v1"
+        
+        # Parameters for image search
+        params = {
+            "key": api_key,
+            "cx": cse_id,
+            "q": query,
+            "searchType": "image",
+            "num": min(num_results, 10)  # API limit is 10 per request
+        }
+        
+        # Make request
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        
+        # Parse results
+        data = response.json()
+        results = []
+        
+        for item in data.get("items", [])[:num_results]:
+            result = {
+                "title": item.get("title"),
+                "link": item.get("link"),  # Image URL
+                "contextLink": item.get("image", {}).get("contextLink", ""),
+                "thumbnailLink": item.get("image", {}).get("thumbnailLink", ""),
+                "snippet": item.get("snippet", "")
+            }
+            results.append(result)
+        
+        # If we got real results, return them
+        if results:
+            return results
+        
+        # Otherwise, return mock data
+        return get_mock_image_results(query, num_results)
+        
+    except Exception as e:
+        print(f"Error in image search: {str(e)}")
+        # Return mock data as fallback
+        return get_mock_image_results(query, num_results)
+
 def get_mock_web_results(query, num_results=5):
     """
     Generate mock web search results for testing
@@ -154,6 +223,55 @@ def get_mock_web_results(query, num_results=5):
             "snippet": random.choice(snippets),
             "link": f"https://www.{random.choice(['nature.com', 'science.org', 'thelancet.com', 'nejm.org'])}/articles/{query.replace(' ', '-')}-{i+1}",
             "source": random.choice(sources)
+        }
+        mock_results.append(mock_result)
+    
+    return mock_results
+
+def get_mock_image_results(query, num_results=5):
+    """
+    Generate mock image search results for testing
+    
+    Args:
+        query (str): Image search query
+        num_results (int): Number of results to return
+        
+    Returns:
+        list: List of mock image search results
+    """
+    mock_results = []
+    
+    # Common medical research topics for images
+    image_topics = [
+        f"{query} treatment diagram",
+        f"{query} research chart",
+        f"{query} medical illustration",
+        f"{query} clinical trial infographic",
+        f"{query} drug molecule structure",
+        f"{query} therapy process",
+        f"{query} patient care visualization",
+        f"{query} medical research data"
+    ]
+    
+    base_urls = [
+        "https://example.com/images/",
+        "https://research.example.com/img/",
+        "https://medical.example.com/graphics/"
+    ]
+    
+    extensions = [".jpg", ".png", ".gif", ".svg"]
+    
+    for i in range(min(num_results, 10)):
+        topic = random.choice(image_topics)
+        base_url = random.choice(base_urls)
+        ext = random.choice(extensions)
+        
+        mock_result = {
+            "title": f"{topic} - Illustration {i+1}",
+            "link": f"{base_url}{query.replace(' ', '_')}_{i+1}{ext}",
+            "contextLink": f"https://example.com/research/{query.replace(' ', '-')}-study-{i+1}",
+            "thumbnailLink": f"{base_url}thumb/{query.replace(' ', '_')}_{i+1}_thumb{ext}",
+            "snippet": f"Medical illustration showing {topic} for research purposes."
         }
         mock_results.append(mock_result)
     

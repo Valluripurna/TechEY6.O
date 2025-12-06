@@ -5,6 +5,7 @@ import os
 import json
 from datetime import datetime
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
@@ -21,9 +22,12 @@ def synthesize_report_with_llm(query, data):
         str: Natural language report
     """
     try:
-        # In a real implementation, this would call an LLM API like Gemini or GPT
-        # For now, we'll create a sophisticated mock that simulates LLM behavior
+        # Try to use Google Gemini API first
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        if gemini_api_key and gemini_api_key != "your_gemini_api_key_here":
+            return _synthesize_with_gemini(query, data, gemini_api_key)
         
+        # Fallback to existing implementation if Gemini API key is not available
         # Create a prompt that would be sent to an LLM
         prompt = f"""
         Create a comprehensive pharmaceutical research report based on the following data.
@@ -240,6 +244,63 @@ def generate_visualization_data(data):
                 }
     
     return viz_data
+
+def _synthesize_with_gemini(query, data, api_key):
+    """
+    Synthesize a report using Google Gemini API
+    
+    Args:
+        query (str): Original query
+        data (dict): Collected data
+        api_key (str): Gemini API key
+        
+    Returns:
+        str: Gemini-generated report
+    """
+    try:
+        # Configure the Gemini API
+        genai.configure(api_key=api_key)
+        
+        # Create the model
+        model = genai.GenerativeModel('gemini-pro')
+        
+        # Create a prompt for Gemini
+        prompt = f"""
+        Act as a pharmaceutical research analyst. Create a comprehensive pharmaceutical research report 
+        based on the following data.
+        
+        Query: {query}
+        
+        Data:
+        {json.dumps(data, indent=2)}
+        
+        Please provide a detailed report with:
+        1. An executive summary (2-3 paragraphs)
+        2. Key findings for each data category with specific insights
+        3. Strategic insights and actionable recommendations
+        4. Future research directions and opportunities
+        5. Risk factors and mitigation strategies
+        
+        Format the response as a professional pharmaceutical research report with clear headings and 
+        structured content. Use technical language appropriate for pharmaceutical researchers and 
+        industry professionals. Include specific numbers and data points from the provided data where 
+        relevant.
+        """
+        
+        # Generate content
+        response = model.generate_content(prompt)
+        
+        # Return the generated text
+        if response and response.text:
+            return response.text
+        else:
+            # Fallback if Gemini didn't return content
+            return _generate_mock_llm_response(query, data)
+            
+    except Exception as e:
+        print(f"Error using Gemini API: {str(e)}")
+        # Fallback to mock response if Gemini fails
+        return _generate_mock_llm_response(query, data)
 
 # Example usage:
 # report = synthesize_report_with_llm("diabetes treatment", sample_data)
