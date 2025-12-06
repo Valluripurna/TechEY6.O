@@ -87,7 +87,9 @@ export default function Login() {
       toast({ title: "Signup verified", description: "Your account is ready" });
       localStorage.setItem("token", data.token);
       setIsSignup(false);
-      navigate('/dashboard');
+      // Redirect to the main app URL after successful signup
+      // Use full origin so the browser performs a hard redirect
+      window.location.href = 'http://localhost:8080/';
     } catch (e: any) {
       toast({ title: "OTP verification failed", description: e?.message || "Invalid or expired OTP", variant: "destructive" });
     }

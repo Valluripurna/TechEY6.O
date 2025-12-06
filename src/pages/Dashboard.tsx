@@ -27,6 +27,7 @@ const processSteps = [
 export default function Dashboard() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [userName, setUserName] = useState<string | null>(null);
+  const [downloadsTotal, setDownloadsTotal] = useState<number>(0);
 
   useEffect(() => {
     try {
@@ -38,6 +39,20 @@ export default function Dashboard() {
     } catch (e) {
       setUserName(null);
     }
+    // fetch reports metrics (downloads total)
+    (async () => {
+      try {
+        const token = localStorage.getItem('token');
+        const headers: any = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        const resp = await fetch('http://localhost:4000/api/reports', { headers });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data && typeof data.downloads_total === 'number') setDownloadsTotal(data.downloads_total);
+      } catch (e) {
+        // ignore
+      }
+    })();
   }, []);
 
   return (
@@ -76,8 +91,8 @@ export default function Dashboard() {
               <div className="flex items-start justify-between mb-4">
                 <div className="flex-1">
                   <p className="text-sm font-medium text-muted-foreground mb-1">Reports Downloaded</p>
-                  <h3 className="text-3xl md:text-4xl font-bold text-foreground mb-2">0</h3>
-                  <p className="text-xs text-muted-foreground">No reports yet</p>
+                      <h3 className="text-3xl md:text-4xl font-bold text-foreground mb-2">{downloadsTotal}</h3>
+                      <p className="text-xs text-muted-foreground">Total report downloads</p>
                 </div>
                 <div className="flex-shrink-0 p-3 rounded-xl bg-gradient-to-br from-primary/20 to-primary/10">
                   <Download className="h-6 w-6 md:h-7 md:w-7 text-primary" />

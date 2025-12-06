@@ -183,31 +183,65 @@ export default function Chat() {
 
     setIsLoading(true);
     try {
+      const token = localStorage.getItem('token');
+      const headers: any = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
       const res = await fetch(`${API}/api/generate-report`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ 
           query: queryText, 
           results: lastMessage.content,
           type: reportType
         })
       });
-
       if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || 'Failed to generate report');
+        // Try parse error JSON
+        let errMsg = 'Failed to generate report';
+        try {
+          const err = await res.json();
+          errMsg = err.error || err.msg || errMsg;
+        } catch {}
+        throw new Error(errMsg);
       }
 
-      // Handle PDF and Excel downloads only
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `pharma-report-${new Date().toISOString().slice(0, 10)}.${reportType === 'pdf' ? 'pdf' : 'xlsx'}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url); // Clean up the URL object
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = await res.json();
+        // Expecting { report_id, download_url }
+        if (data && data.download_url && data.report_id) {
+          const token = localStorage.getItem('token');
+          const dlHeaders: any = {};
+          if (token) dlHeaders['Authorization'] = `Bearer ${token}`;
+          const dlResp = await fetch(`${API}${data.download_url}`, { headers: dlHeaders });
+          if (!dlResp.ok) {
+            const txt = await dlResp.text().catch(() => '');
+            throw new Error(txt || 'Failed to download generated report');
+          }
+          const blob = await dlResp.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `pharma-report-${new Date().toISOString().slice(0, 10)}.${reportType === 'pdf' ? 'pdf' : 'xlsx'}`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+        } else {
+          throw new Error('Report generated but download URL missing');
+        }
+      } else {
+        // Fallback for raw file response
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `pharma-report-${new Date().toISOString().slice(0, 10)}.${reportType === 'pdf' ? 'pdf' : 'xlsx'}`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      }
 
     } catch (error) {
       console.error("Error generating report:", error);

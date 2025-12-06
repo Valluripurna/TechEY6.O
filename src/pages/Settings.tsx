@@ -19,6 +19,7 @@ export default function Settings() {
   const [fullName, setFullName] = useState('');
   const [emailValue, setEmailValue] = useState('');
   const [roleValue, setRoleValue] = useState('');
+  const [emailNotifications, setEmailNotifications] = useState(true);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -31,6 +32,7 @@ export default function Settings() {
         setFullName(u.name || '');
         setEmailValue(u.email || '');
         setRoleValue(u.role || '');
+        setEmailNotifications(u.email_notifications !== false);
       })
       .catch(() => {
         // ignore failures silently
@@ -102,7 +104,7 @@ export default function Settings() {
                     const res = await fetch(`${API}/api/auth/me`, {
                       method: 'PUT',
                       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                      body: JSON.stringify({ name: fullName, email: emailValue, role: roleValue })
+                      body: JSON.stringify({ name: fullName, email: emailValue, role: roleValue, email_notifications: emailNotifications })
                     });
                     const data = await res.json();
                     if (!res.ok) throw new Error(data.msg || 'Failed to update');
@@ -152,7 +154,7 @@ export default function Settings() {
                       Receive email updates about your reports
                     </p>
                   </div>
-                  <Switch defaultChecked className="flex-shrink-0 data-[state=checked]:bg-primary data-[state=unchecked]:bg-muted" />
+                  <Switch checked={emailNotifications} onCheckedChange={(v: boolean) => setEmailNotifications(Boolean(v))} className="flex-shrink-0 data-[state=checked]:bg-primary data-[state=unchecked]:bg-muted" />
                 </div>
                 <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors">
                   <div className="space-y-0.5 min-w-0 flex-1">

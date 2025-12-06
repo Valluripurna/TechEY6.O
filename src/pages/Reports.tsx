@@ -27,54 +27,81 @@ export default function Reports() {
   const [counts, setCounts] = useState<{ total: number; pdf: number; excel: number; text: number }>({ total: 0, pdf: 0, excel: 0, text: 0 });
 
   // Fetch reports history from backend
-  React.useEffect(() => {
-    const fetchReports = async () => {
-      try {
-        const resp = await fetch('http://localhost:4000/api/reports');
-        if (!resp.ok) throw new Error('Failed to load reports');
-        const data = await resp.json();
-        // Normalize data into UI Report shape
-        const items: Report[] = (data.reports || []).map((r: any) => ({
-          id: r.report_id,
-          title: r.query,
-          agent: r.report_type.toUpperCase(),
-          date: r.generated_at,
-          size: (r.metadata?.data_points ?? 0) + ' items'
-        }));
-        setReports(items);
-        if (data.counts) {
-          setCounts({
-            total: data.counts.total ?? items.length,
-            pdf: data.counts.pdf ?? 0,
-            excel: data.counts.excel ?? 0,
-            text: data.counts.text ?? 0
-          });
-        } else {
-          // Fallback compute
-          setCounts({
-            total: items.length,
-            pdf: items.filter(i => i.agent === 'PDF').length,
-            excel: items.filter(i => i.agent === 'EXCEL').length,
-            text: items.filter(i => i.agent === 'TEXT').length,
-          });
-        }
-      } catch (e) {
-        console.error(e);
+  const fetchReports = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const headers: any = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const resp = await fetch('http://localhost:4000/api/reports', { headers });
+      if (!resp.ok) throw new Error('Failed to load reports');
+      const data = await resp.json();
+      // Normalize data into UI Report shape
+      const items: Report[] = (data.reports || []).map((r: any) => ({
+        id: r.report_id,
+        title: r.query,
+        agent: r.report_type.toUpperCase(),
+        date: r.generated_at,
+        size: (r.metadata?.data_points ?? 0) + ' items'
+      }));
+      setReports(items);
+      if (data.counts) {
+        setCounts({
+          total: data.counts.total ?? items.length,
+          pdf: data.counts.pdf ?? 0,
+          excel: data.counts.excel ?? 0,
+          text: data.counts.text ?? 0
+        });
+      } else {
+        // Fallback compute
+        setCounts({
+          total: items.length,
+          pdf: items.filter(i => i.agent === 'PDF').length,
+          excel: items.filter(i => i.agent === 'EXCEL').length,
+          text: items.filter(i => i.agent === 'TEXT').length,
+        });
       }
-    };
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  React.useEffect(() => {
     fetchReports();
   }, []);
 
   const downloadGeneratedReport = async (type: 'pdf' | 'excel', query: string, results?: any) => {
     try {
+      const token = localStorage.getItem('token');
+      const headers: any = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
       const resp = await fetch('http://localhost:4000/api/generate-report', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ query, type, results })
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.error || 'Failed to generate report');
+      }
+      const contentType = resp.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const json = await resp.json();
+        if (json && json.download_url) {
+          const dlResp = await fetch(`http://localhost:4000${json.download_url}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+          if (!dlResp.ok) throw new Error('Failed to download generated report');
+          const blob = await dlResp.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `report_${Date.now()}.${type === 'pdf' ? 'pdf' : 'xlsx'}`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+          // After download the backend deletes the stored report; refresh list
+          await fetchReports();
+          return;
+        }
       }
       const blob = await resp.blob();
       const url = window.URL.createObjectURL(blob);
@@ -93,7 +120,10 @@ export default function Reports() {
 
   const downloadStoredReport = async (reportId: string, typeHint?: 'pdf'|'excel') => {
     try {
-      const resp = await fetch(`http://localhost:4000/api/reports/${reportId}/download`);
+      const token = localStorage.getItem('token');
+      const headers: any = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const resp = await fetch(`http://localhost:4000/api/reports/${reportId}/download`, { headers });
       if (!resp.ok) {
         const errText = await resp.text();
         throw new Error(errText || 'Failed to download report');
@@ -107,6 +137,25 @@ export default function Reports() {
       a.click();
       a.remove();
       window.URL.revokeObjectURL(url);
+      // After server-side download endpoint deletes the report, refresh list
+      await fetchReports();
+    } catch (e) {
+      console.error(e);
+      alert((e as Error).message);
+    }
+  };
+
+  const deleteStoredReport = async (reportId: string) => {
+    try {
+      const token = localStorage.getItem('token');
+      const headers: any = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const resp = await fetch(`http://localhost:4000/api/reports/${reportId}`, { method: 'DELETE', headers });
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(txt || 'Failed to delete report');
+      }
+      await fetchReports();
     } catch (e) {
       console.error(e);
       alert((e as Error).message);
@@ -292,6 +341,14 @@ export default function Reports() {
                           <Download className="h-4 w-4 mr-2" />
                           Excel
                         </Button>
+                                <Button
+                                  size="sm"
+                                  variant="destructive"
+                                  onClick={() => deleteStoredReport(report.id)}
+                                  className="flex-shrink-0 ml-2 bg-red-600 hover:opacity-90 transition-all group-hover:scale-105"
+                                >
+                                  Delete
+                                </Button>
                       </div>
                     </div>
                   </CardContent>

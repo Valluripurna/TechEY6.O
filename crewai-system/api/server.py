@@ -63,6 +63,27 @@ def send_otp_email(to_email: str, subject: str, otp: str):
         server.login(EMAIL_USER, EMAIL_PASS)
         server.sendmail(EMAIL_USER, to_email, msg.as_string())
 
+
+def send_email(to_email: str, subject: str, body: str, html: bool = False):
+    """Send a generic email using configured SMTP credentials."""
+    if not EMAIL_USER or not EMAIL_PASS:
+        raise ValueError('EMAIL_USER/EMAIL_PASS not set in environment')
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_USER
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    if html:
+        msg.attach(MIMEText(body, 'html'))
+    else:
+        msg.attach(MIMEText(body, 'plain'))
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.sendmail(EMAIL_USER, to_email, msg.as_string())
+    except Exception as e:
+        print(f"Failed to send email to {to_email}: {e}")
+
 def get_mongo_client():
     """Create and return a MongoDB client"""
     MONGO_URI = os.environ.get("MONGO_URI")
@@ -131,26 +152,33 @@ def signup():
         # Hash password
         hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
         
-        # Create user
+        # Create user and generate signup OTP
+        otp_code = generate_otp()
+        otp_expires = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
+
         user = {
             "name": name,
             "email": email,
             "password": hashed_password,
             "role": role,
             "verified": False,
+            # notification preferences
+            "email_notifications": True,
+            "signup_otp": otp_code,
+            "signup_otp_expires": otp_expires,
             "created_at": datetime.utcnow().isoformat()
         }
-        
+
         result = users_collection.insert_one(user)
         user_id = str(result.inserted_id)
-        
+
         # Send signup OTP
         try:
-            send_otp_email(email, 'Verify your email (OTP)', user['signup_otp'])
+            send_otp_email(email, 'Verify your email (OTP)', otp_code)
         except Exception as mail_err:
             print(f"Failed to send signup OTP: {mail_err}")
             return jsonify({"msg": "User created, but OTP email failed. Contact support.", "user_id": user_id}), 200
-        
+
         return jsonify({"msg": "Signup successful. OTP sent to your email.", "user_id": user_id}), 200
         
     except Exception as e:
@@ -252,12 +280,13 @@ def get_user(current_user_id):
         if not user:
             return jsonify({"msg": "User not found"}), 404
         
-        # Return user data without password
+        # Return user data without password, include preferences
         user_response = {
             "id": str(user['_id']),
             "name": user['name'],
             "email": user['email'],
-            "role": user.get('role', '')
+            "role": user.get('role', ''),
+            "email_notifications": bool(user.get('email_notifications', True))
         }
         
         return jsonify({"user": user_response}), 200
@@ -295,6 +324,12 @@ def update_user(current_user_id):
             update_data['email'] = email
         if role is not None:
             update_data['role'] = role
+        # Notification preferences
+        if 'email_notifications' in data:
+            try:
+                update_data['email_notifications'] = bool(data.get('email_notifications'))
+            except Exception:
+                pass
             
         # Update user
         users_collection.update_one(
@@ -611,6 +646,7 @@ def generate_report():
             "file_path": filepath if report_type in ['pdf', 'excel'] else None,
             "generated_at": datetime.now().isoformat(),
             "generated_by": user_id,
+            "downloads": 0,
             "metadata": {
                 "sections": list(filtered_results.keys()),
                 "data_points": sum(len(v) if isinstance(v, list) else 1 for v in filtered_results.values())
@@ -640,6 +676,55 @@ def generate_report():
         result = reports_collection.insert_one(report_record)
         print(f"Report record inserted with ID: {result.inserted_id}")
 
+        # Check Authorization header for user token to optionally send email notification
+        try:
+            auth_header = request.headers.get('Authorization', '')
+            token = None
+            if auth_header:
+                parts = auth_header.split(' ')
+                if len(parts) == 2 and parts[0] == 'Bearer':
+                    token = parts[1]
+            if token:
+                try:
+                    decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+                    current_user_id = decoded.get('id')
+                except Exception:
+                    current_user_id = None
+            else:
+                current_user_id = None
+
+            if current_user_id:
+                try:
+                    users_collection = db['users']
+                    user = users_collection.find_one({"_id": ObjectId(current_user_id)})
+                    if user and bool(user.get('email_notifications', True)):
+                        user_email = user.get('email')
+                        if user_email:
+                            # Prepare a professional email notifying about report download
+                            subject = 'Your Pharma Mind Nexus report is ready'
+                            report_url = None
+                            try:
+                                # If the report was stored, provide a link to retrieve it
+                                report_url = f"{request.host_url.rstrip('/')}/api/reports/{report_id}"
+                            except Exception:
+                                report_url = None
+                            body_html = f"<p>Dear {user.get('name', '')},</p>\n"
+                            body_html += f"<p>Your requested report (<strong>{report_record.get('query')}</strong>) has been generated on {report_record.get('generated_at')}. "
+                            if report_url:
+                                body_html += f"You can download it here: <a href='{report_url}'>Download Report</a>."
+                            body_html += "</p>\n"
+                            body_html += "<p>If you did not request this report or have any questions, please contact our support team.</p>\n"
+                            body_html += "<p>Regards,<br/>Pharma Mind Nexus Team</p>"
+                            try:
+                                send_email(user_email, subject, body_html, html=True)
+                                print(f"Notification email sent to {user_email}")
+                            except Exception as mail_err:
+                                print(f"Failed to send report notification to {user_email}: {mail_err}")
+                except Exception as e:
+                    print(f"Error while attempting to notify user: {e}")
+        except Exception:
+            pass
+
         # If we generated a parallel Excel, insert a separate record for it
         if report_type == 'pdf' and 'excel_path' in locals() and excel_path:
             try:
@@ -658,16 +743,9 @@ def generate_report():
         # Return appropriate response
         print("Returning response...")
         if report_type in ['pdf', 'excel'] and filepath:
-            # Prefer streaming from DB if binary was captured; fallback to file path
-            try:
-                if 'file_data' in report_record:
-                    data_bytes = bytes(report_record['file_data'])
-                    download_name = os.path.basename(filepath)
-                    return send_file(io.BytesIO(data_bytes), as_attachment=True, download_name=download_name)
-            except Exception as stream_err:
-                print(f"Stream from DB failed, falling back to file path: {stream_err}")
-            # Fallback to sending the file by path
-            return send_file(filepath, as_attachment=True)
+            # For file reports, return the report id and a download URL; frontend should call /api/reports/<report_id>/download
+            download_url = f"/api/reports/{report_id}/download"
+            return jsonify({"report_id": report_id, "download_url": download_url}), 200
         elif report_type == 'text' and summary:
             response = jsonify({
                 "query": query,
@@ -677,7 +755,7 @@ def generate_report():
             })
         else:
             response = jsonify({"error": "Invalid report type or missing data"}), 400
-            
+
         return response
             
     except Exception as e:
@@ -713,10 +791,15 @@ def list_reports():
             "_id": 0
         }))
         
+        # Fetch total downloads metric if available
+        metrics_collection = db["metrics"]
+        metrics_doc = metrics_collection.find_one({"_id": "downloads"})
+        downloads_total = int(metrics_doc.get('count', 0)) if metrics_doc else 0
+
         # Close MongoDB connection
         client.close()
-        
-        # Return reports list with counts
+
+        # Return reports list with counts and downloads total
         total = len(reports)
         pdf_count = sum(1 for r in reports if r.get('report_type') == 'pdf')
         excel_count = sum(1 for r in reports if r.get('report_type') == 'excel')
@@ -728,7 +811,8 @@ def list_reports():
                 "pdf": pdf_count,
                 "excel": excel_count,
                 "text": text_count
-            }
+            },
+            "downloads_total": downloads_total
         })
         
     except Exception as e:
@@ -763,60 +847,99 @@ def get_report(report_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/api/reports/<report_id>/download', methods=['GET'])
 def download_report(report_id):
-    """Download a stored report by ID"""
+    """Stream a stored report file, increment download metric, and delete report record."""
     client = None
     try:
         client = get_mongo_client()
         db = client["pharma_hub"]
         reports_collection = db["reports"]
-        
+
         report = reports_collection.find_one({"report_id": report_id})
-        
         if not report:
             return jsonify({"error": "Report not found"}), 404
-            
-        if "file_data" not in report:
-            return jsonify({"error": "No file data available for this report"}), 404
-            
-        file_data = report["file_data"]
-        report_type = report["report_type"]
-        query = report["query"]
-        
-        filename = f"{query.replace(' ', '_')}_{report_id}.{report_type}"
 
-        # Increment download counters
+        # Try to get file bytes
+        file_bytes = None
+        download_name = None
+        if report.get('file_data'):
+            try:
+                file_bytes = bytes(report['file_data'])
+                download_name = os.path.basename(report.get('file_path') or f"report_{report_id}")
+            except Exception as e:
+                print(f"Failed to read file_data for report {report_id}: {e}")
+        elif report.get('file_path') and os.path.exists(report['file_path']):
+            try:
+                with open(report['file_path'], 'rb') as f:
+                    file_bytes = f.read()
+                download_name = os.path.basename(report.get('file_path'))
+            except Exception as e:
+                print(f"Failed to read file at path for report {report_id}: {e}")
+
+        if not file_bytes:
+            return jsonify({"error": "Report file not available"}), 404
+
+        # Increment global downloads metric
         try:
-            # Per-report download count
-            reports_collection.update_one({"report_id": report_id}, {"$inc": {"download_count": 1}})
-            # Global counters
-            stats_collection = db.get_collection("stats")
-            stats_collection.update_one(
-                {"_id": "downloads"},
-                {"$inc": {f"{report_type}_downloads": 1, "total_downloads": 1}},
-                upsert=True
-            )
-        except Exception as cnt_err:
-            print(f"Failed to increment download counters: {cnt_err}")
-        
-        return send_file(
-            io.BytesIO(bytes(file_data)),
-            mimetype=f"application/{report_type}",
-            as_attachment=True,
-            download_name=filename
-        )
-        
+            metrics_collection = db.get_collection('metrics')
+            metrics_collection.update_one({"_id": "downloads"}, {"$inc": {"count": 1}}, upsert=True)
+        except Exception as me:
+            print(f"Failed to increment downloads metric: {me}")
+
+        # Delete the report record
+        try:
+            reports_collection.delete_one({"report_id": report_id})
+        except Exception as de:
+            print(f"Failed to delete report {report_id}: {de}")
+
+        # Stream the file back
+        return send_file(io.BytesIO(file_bytes), as_attachment=True, download_name=download_name)
+
     except Exception as e:
-        print(f"Error downloading report: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Failed to download report: {str(e)}"}), 500
+        print(f"Error during report download: {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         if client:
             try:
                 client.close()
-            except:
+            except Exception:
+                pass
+
+
+@app.route('/api/reports/<report_id>', methods=['DELETE'])
+def delete_report(report_id):
+    """Delete a stored report by ID."""
+    client = None
+    try:
+        client = get_mongo_client()
+        db = client["pharma_hub"]
+        reports_collection = db["reports"]
+
+        report = reports_collection.find_one({"report_id": report_id})
+        if not report:
+            return jsonify({"error": "Report not found"}), 404
+
+        # Remove file on disk if exists
+        try:
+            if report.get('file_path') and os.path.exists(report['file_path']):
+                try:
+                    os.remove(report['file_path'])
+                except Exception as e:
+                    print(f"Failed to remove file for report {report_id}: {e}")
+        except Exception:
+            pass
+
+        reports_collection.delete_one({"report_id": report_id})
+        return jsonify({"msg": "Report deleted"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
                 pass
 
 @app.route('/api/reports/stats', methods=['GET'])
