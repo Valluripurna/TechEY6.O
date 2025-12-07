@@ -23,16 +23,31 @@ from datetime import timedelta
 
 # Import agents
 from agents import exim_agent, trials_agent, iqvia_agent, patent_agent, webintel_agent, internal_agent
+from agents.knowledge_agent import KnowledgeAgent
+from agents.medical_reasoner import MedicalReasoner
 from reports import report_generator
 # Import the master agent from local_langchain instead of langchain
 from local_langchain.master_agent import run_master_agent
+from vector.pinecone_client import PineconeClient
+from utils import generate_response, DOCUMENT_FIRST_SYSTEM_PROMPT
+
+# Initialize agents
+pinecone_client = PineconeClient()
+knowledge_agent = KnowledgeAgent(pinecone_client)
+medical_reasoner = MedicalReasoner()
 
 # Load environment variables
 load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 CORS(app)  # Enable CORS for all routes
+
+# Set max content length for form data specifically
+app.config['MAX_FORM_MEMORY_SIZE'] = 16 * 1024 * 1024  # 16MB
+
+
 
 # SMTP configuration for OTP
 EMAIL_USER = os.environ.get('EMAIL_USER')
@@ -111,13 +126,39 @@ def signup():
     """User signup endpoint"""
     try:
         data = request.get_json()
+        print(f"Signup request data: {data}")  # Debug log
+        
         name = data.get('name')
         email = data.get('email')
         password = data.get('password')
         role = data.get('role', '')
         
+        # Validate required fields
         if not name or not email or not password:
-            return jsonify({"msg": "Missing fields"}), 400
+            missing_fields = []
+            if not name:
+                missing_fields.append('name')
+            if not email:
+                missing_fields.append('email')
+            if not password:
+                missing_fields.append('password')
+            error_msg = f"Missing required fields: {', '.join(missing_fields)}"
+            print(f"Signup validation error: {error_msg}")
+            return jsonify({"msg": error_msg}), 400
+        
+        # Validate email format
+        import re
+        email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_regex, email):
+            error_msg = "Invalid email format"
+            print(f"Signup validation error: {error_msg}")
+            return jsonify({"msg": error_msg}), 400
+        
+        # Validate password strength
+        if len(password) < 6:
+            error_msg = "Password must be at least 6 characters long"
+            print(f"Signup validation error: {error_msg}")
+            return jsonify({"msg": error_msg}), 400
         
         client = get_mongo_client()
         db = client["pharma_hub"]
@@ -126,34 +167,61 @@ def signup():
         # Check if user already exists
         existing_user = users_collection.find_one({"email": email})
         if existing_user:
-            return jsonify({"msg": "Email already in use"}), 400
+            error_msg = "Email already in use"
+            print(f"Signup validation error: {error_msg}")
+            return jsonify({"msg": error_msg}), 400
+        
+        # Generate OTP for email verification
+        signup_otp = generate_otp()
+        otp_expires = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
         
         # Hash password
         hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
         
         # Create user
-        user = {
+        user_data = {
             "name": name,
             "email": email,
             "password": hashed_password,
             "role": role,
             "verified": False,
+            "signup_otp": signup_otp,
+            "signup_otp_expires": otp_expires,
             "created_at": datetime.utcnow().isoformat()
         }
         
-        result = users_collection.insert_one(user)
+        result = users_collection.insert_one(user_data)
         user_id = str(result.inserted_id)
         
-        # Send signup OTP
+        # Send signup OTP (but don't fail signup if email fails)
+        email_success = False
         try:
-            send_otp_email(email, 'Verify your email (OTP)', user['signup_otp'])
+            send_otp_email(email, 'Verify your email (OTP)', signup_otp)
+            email_success = True
+            print(f"Signup OTP email sent successfully to {email}")
         except Exception as mail_err:
-            print(f"Failed to send signup OTP: {mail_err}")
-            return jsonify({"msg": "User created, but OTP email failed. Contact support.", "user_id": user_id}), 200
+            error_msg = f"Failed to send signup OTP email: {str(mail_err)}"
+            print(f"Signup email error: {error_msg}")
+            # We don't return an error here - we still want to allow signup even if email fails
         
-        return jsonify({"msg": "Signup successful. OTP sent to your email.", "user_id": user_id}), 200
+        # Return success response
+        if email_success:
+            success_msg = "Signup successful. OTP sent to your email."
+            return jsonify({"msg": success_msg, "user_id": user_id}), 200
+        else:
+            success_msg = "Signup successful. Email verification temporarily unavailable."
+            # Update user to indicate verification is not needed
+            users_collection.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"verification_needed": False}}
+            )
+            return jsonify({"msg": success_msg, "user_id": user_id}), 200
         
     except Exception as e:
+        error_msg = f"Server error during signup: {str(e)}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
         return jsonify({"msg": "Server error"}), 500
     finally:
         if 'client' in locals():
@@ -174,6 +242,15 @@ def verify_otp():
             return jsonify({"msg": "User not found"}), 404
         if user.get('verified'):
             return jsonify({"msg": "Already verified"}), 200
+            
+        # Check if account doesn't require verification (was created when email was down)
+        if user.get('verification_needed') == False:
+            # Mark as verified and generate token
+            users.update_one({"email": email}, {"$set": {"verified": True}})
+            token = jwt.encode({'id': str(user['_id'])}, JWT_SECRET, algorithm="HS256")
+            return jsonify({"msg": "Verification successful", "token": token}), 200
+            
+        # Normal verification flow
         if user.get('signup_otp') != otp:
             return jsonify({"msg": "Invalid OTP"}), 400
         # Check expiry
@@ -899,6 +976,469 @@ def reset_password():
         return jsonify({"msg": "Password updated successfully"}), 200
     except Exception:
         return jsonify({"msg": "Server error"}), 500
+
+@app.route('/api/documents/upload', methods=['POST'])
+@token_required
+def upload_document(current_user_id):
+    """Upload and process a document for the knowledge base"""
+    # Increase the max content length for this specific route
+    from werkzeug.exceptions import RequestEntityTooLarge
+    try:
+        # Get form data
+        title = request.form.get('title')
+        content = request.form.get('content')
+        
+        if not title or not content:
+            return jsonify({"error": "Title and content are required"}), 400
+        
+        # Get user info
+        client = get_mongo_client()
+        db = client["pharma_hub"]
+        users_collection = db["users"]
+        user = users_collection.find_one({"_id": ObjectId(current_user_id)})
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        # Process document: Parse, clean, chunk, and prepare for embedding
+        processed_content = process_document_content(content)
+        
+        # Upload document using internal agent
+        doc_id = internal_agent.upload_document(
+            title=title,
+            text=processed_content,
+            uploaded_by=user.get("email", "Unknown User")
+        )
+        
+        return jsonify({
+            "message": "Document uploaded and processed successfully",
+            "doc_id": doc_id
+        }), 200
+        
+    except RequestEntityTooLarge:
+        return jsonify({"error": "File too large. Maximum size allowed is 16MB."}), 413
+    except Exception as e:
+        print(f"Error uploading document: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to upload document: {str(e)}"}), 500
+    finally:
+        if 'client' in locals():
+            client.close()
+
+def process_document_content(content):
+    """Process document content: parse, clean, and chunk for embedding"""
+    # Clean the content
+    cleaned_content = clean_document_content(content)
+    
+    # Chunk the content for better embedding and retrieval
+    chunks = chunk_document_content(cleaned_content)
+    
+    # For now, we'll store the cleaned content
+    # In a full implementation, we would also generate embeddings here
+    return cleaned_content
+
+def clean_document_content(content):
+    """Clean document content by removing extra whitespace and formatting"""
+    import re
+    
+    # Remove excessive whitespace
+    content = re.sub(r'\s+', ' ', content)
+    
+    # Remove special characters that might interfere with processing
+    content = re.sub(r'[^\w\s\.\,\;\:\!\?\-\(\)\[\]\{\}\"\'\/\\]', ' ', content)
+    
+    # Normalize quotation marks
+    content = content.replace('"', '"').replace('"', '"')
+    content = content.replace("'", "'").replace("'", "'")
+    
+    # Trim and return
+    return content.strip()
+
+def chunk_document_content(content, chunk_size=1000, overlap=200):
+    """Chunk document content for better embedding and retrieval"""
+    chunks = []
+    
+    # Simple chunking by sentences
+    import re
+    sentences = re.split(r'[.!?]+', content)
+    
+    current_chunk = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        # If adding this sentence would exceed chunk size, save current chunk
+        if len(current_chunk) + len(sentence) > chunk_size and current_chunk:
+            chunks.append(current_chunk.strip())
+            # Start new chunk with overlap
+            words = current_chunk.split()
+            overlap_words = words[-(overlap//5):] if len(words) > overlap//5 else []
+            current_chunk = " ".join(overlap_words) + " " + sentence + " "
+        else:
+            current_chunk += sentence + ". "
+    
+    # Add the final chunk if it has content
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks
+
+@app.route('/api/documents/chat', methods=['POST'])
+@token_required
+def chat_with_documents(current_user_id):
+    """PharmaMind Nexus - Medical Knowledge Retrieval AI with Enhanced Analysis"""
+    try:
+        data = request.get_json()
+        query = data.get('query')
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        # Use the KnowledgeAgent for the complete pipeline
+        response_text = knowledge_agent.run(query)
+        
+        return jsonify({
+            "query": query,
+            "response": response_text,
+            "timestamp": datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in document chat: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to process chat request: {str(e)}"}), 500
+
+def generate_pharmamind_nexus_response(query, results):
+    """Generate an enhanced PharmaMind Nexus response combining document content with model analysis"""
+    response_parts = []
+    
+    # 📄 1. Answer Based on Uploaded Documents
+    doc_results = results.get('documents', {})
+    doc_matches = doc_results.get('matches', []) if isinstance(doc_results, dict) else []
+    
+    response_parts.append("📄 1. Answer Based on Uploaded Documents")
+    response_parts.append("")
+    
+    if doc_matches:
+        # Extract exact sentences, sections, bullet points, tables or data directly from the documents
+        doc_findings = []
+        for i, match in enumerate(doc_matches[:5], 1):  # Up to 5 most relevant documents
+            metadata = match.get('metadata', {}) if isinstance(match, dict) else {}
+            title = metadata.get('title', f'Document {i}') if isinstance(metadata, dict) else f'Document {i}'
+            text = metadata.get('text', 'No content available') if isinstance(metadata, dict) else 'No content available'
+            
+            # Limit text length for readability
+            if len(text) > 300:
+                text = text[:300] + "..."
+            
+            doc_findings.append(f"{i}. {title}: {text}")
+        
+        response_parts.append("\n".join(doc_findings))
+    else:
+        response_parts.append("No relevant information found in uploaded documents.")
+    
+    # 🔍 2. AI-Enhanced Analysis (combining document content with model reasoning)
+    response_parts.append("")
+    response_parts.append("🔍 2. AI-Enhanced Medical Analysis")
+    response_parts.append("")
+    
+    # Perform deep analysis combining document content with medical knowledge
+    analysis = perform_deep_medical_analysis(query, doc_matches, results)
+    response_parts.append(analysis)
+    
+    # 📚 3. Sources Used
+    response_parts.append("")
+    response_parts.append("📚 Sources Used")
+    response_parts.append("")
+    
+    if doc_matches:
+        response_parts.append("From Your Documents:")
+        for i, match in enumerate(doc_matches[:3], 1):
+            metadata = match.get('metadata', {}) if isinstance(match, dict) else {}
+            title = metadata.get('title', f'Document {i}') if isinstance(metadata, dict) else f'Document {i}'
+            response_parts.append(f"{i}. {title}")
+    else:
+        response_parts.append("From Your Documents:")
+        response_parts.append("No relevant documents found.")
+    
+    # Add external sources if used
+    try:
+        external_data = results.get('external', {})
+        external_sources_added = False
+        
+        # Check what external data we have
+        if external_data.get('trials'):
+            if not external_sources_added:
+                response_parts.append("")
+                response_parts.append("External Medical Sources:")
+                external_sources_added = True
+            response_parts.append("• Clinical Trials Database")
+        
+        if external_data.get('pubmed'):
+            if not external_sources_added:
+                response_parts.append("")
+                response_parts.append("External Medical Sources:")
+                external_sources_added = True
+            elif not external_sources_added:
+                response_parts.append("• PubMed Database")
+                
+        if external_data.get('fda'):
+            if not external_sources_added:
+                response_parts.append("")
+                response_parts.append("External Medical Sources:")
+                external_sources_added = True
+            response_parts.append("• FDA Database")
+            
+        if external_data.get('google'):
+            if not external_sources_added:
+                response_parts.append("")
+                response_parts.append("External Medical Sources:")
+                external_sources_added = True
+            response_parts.append("• Google Search Results")
+            
+    except Exception as e:
+        print(f"Error processing external sources: {e}")
+    
+    return "\n".join(response_parts) if response_parts else "No relevant information found."
+
+def perform_deep_medical_analysis(query, doc_matches, results):
+    """Perform deep medical analysis combining document content with model reasoning"""
+    analysis_parts = []
+    
+    # If we have document content, analyze it deeply
+    if doc_matches:
+        # Extract document texts for analysis
+        doc_texts = []
+        for match in doc_matches:
+            metadata = match.get('metadata', {}) if isinstance(match, dict) else {}
+            text = metadata.get('text', '') if isinstance(metadata, dict) else ''
+            if text:
+                doc_texts.append(text)
+        
+        # Extract key medical concepts from documents
+        key_concepts = extract_medical_concepts(doc_texts)
+        
+        # Analyze mechanisms of action if mentioned
+        mechanisms = analyze_mechanisms_of_action(doc_texts)
+        if mechanisms:
+            analysis_parts.append("Mechanism of Action:")
+            analysis_parts.append(mechanisms)
+        
+        # Analyze disease pathways if mentioned
+        pathways = analyze_disease_pathways(doc_texts)
+        if pathways:
+            if mechanisms:
+                analysis_parts.append("")
+            analysis_parts.append("Disease Pathway Impact:")
+            analysis_parts.append(pathways)
+        
+        # Analyze clinical evidence
+        evidence = analyze_clinical_evidence(doc_texts)
+        if evidence:
+            if mechanisms or pathways:
+                analysis_parts.append("")
+            analysis_parts.append("Clinical Evidence Summary:")
+            analysis_parts.append(evidence)
+        
+        # Analyze safety and contraindications
+        safety = analyze_safety_profiles(doc_texts)
+        if safety:
+            if mechanisms or pathways or evidence:
+                analysis_parts.append("")
+            analysis_parts.append("Safety Profile:")
+            analysis_parts.append(safety)
+    
+    # If we have external data, incorporate it
+    external_insights = []
+    external_data = results.get('external', {})
+    
+    # Add insights from clinical trials
+    if external_data.get('trials'):
+        trial_insights = analyze_clinical_trial_data(external_data['trials'])
+        if trial_insights:
+            external_insights.append(trial_insights)
+    
+    # Add insights from patents
+    if external_data.get('patents'):
+        patent_insights = analyze_patent_data(external_data['patents'])
+        if patent_insights:
+            external_insights.append(patent_insights)
+    
+    # Add insights from web intelligence
+    if external_data.get('google') or external_data.get('pubmed'):
+        web_data = external_data.get('google', []) + external_data.get('pubmed', [])
+        web_insights = analyze_web_intelligence(web_data)
+        if web_insights:
+            external_insights.append(web_insights)
+    
+    if external_insights:
+        if analysis_parts:
+            analysis_parts.append("")
+            analysis_parts.append("Additional Medical Insights:")
+        else:
+            analysis_parts.append("Medical Insights:")
+        
+        for insight in external_insights:
+            analysis_parts.append(insight)
+    
+    # If no analysis was possible, provide a general medical context
+    if not analysis_parts:
+        general_context = provide_general_medical_context(query)
+        analysis_parts.append(general_context)
+    
+    return "\n".join(analysis_parts)
+
+def extract_medical_concepts(doc_texts):
+    """Extract key medical concepts from document texts"""
+    # In a full implementation, this would use NLP to extract medical entities
+    # For now, we'll return a placeholder
+    if doc_texts:
+        return "Key medical concepts identified from document content."
+    return ""
+
+def analyze_mechanisms_of_action(doc_texts):
+    """Analyze mechanisms of action mentioned in documents"""
+    if not doc_texts:
+        return ""
+        
+    # Look for keywords related to mechanisms of action
+    mech_keywords = ['mechanism', 'inhibit', 'block', 'activate', 'bind', 'target', 'receptor', 'enzyme']
+    relevant_excerpts = []
+    
+    for text in doc_texts:
+        text_lower = text.lower()
+        if any(keyword in text_lower for keyword in mech_keywords):
+            # Find sentences containing keywords
+            import re
+            sentences = re.split(r'[.!?]+', text)
+            for sentence in sentences:
+                if any(keyword in sentence.lower() for keyword in mech_keywords):
+                    relevant_excerpts.append(sentence.strip())
+                    break  # Take first relevant sentence
+    
+    if relevant_excerpts:
+        return "Based on document analysis, the mechanism involves " + relevant_excerpts[0][:100] + "..."
+    return ""
+
+def analyze_disease_pathways(doc_texts):
+    """Analyze disease pathways mentioned in documents"""
+    if not doc_texts:
+        return ""
+        
+    # Look for keywords related to disease pathways
+    pathway_keywords = ['pathway', 'cascade', 'signaling', 'metabolism', 'inflammation', 'immune response']
+    relevant_excerpts = []
+    
+    for text in doc_texts:
+        text_lower = text.lower()
+        if any(keyword in text_lower for keyword in pathway_keywords):
+            # Find sentences containing keywords
+            import re
+            sentences = re.split(r'[.!?]+', text)
+            for sentence in sentences:
+                if any(keyword in sentence.lower() for keyword in pathway_keywords):
+                    relevant_excerpts.append(sentence.strip())
+                    break  # Take first relevant sentence
+    
+    if relevant_excerpts:
+        return "Document content indicates impact on " + relevant_excerpts[0][:100] + "..."
+    return ""
+
+def analyze_clinical_evidence(doc_texts):
+    """Analyze clinical evidence mentioned in documents"""
+    if not doc_texts:
+        return ""
+        
+    # Look for keywords related to clinical evidence
+    evidence_keywords = ['trial', 'study', 'efficacy', 'outcome', 'survival', 'response rate']
+    relevant_excerpts = []
+    
+    for text in doc_texts:
+        text_lower = text.lower()
+        if any(keyword in text_lower for keyword in evidence_keywords):
+            # Find sentences containing keywords
+            import re
+            sentences = re.split(r'[.!?]+', text)
+            for sentence in sentences:
+                if any(keyword in sentence.lower() for keyword in evidence_keywords):
+                    relevant_excerpts.append(sentence.strip())
+                    break  # Take first relevant sentence
+    
+    if relevant_excerpts:
+        return "Clinical evidence from documents shows " + relevant_excerpts[0][:100] + "..."
+    return ""
+
+def analyze_safety_profiles(doc_texts):
+    """Analyze safety profiles mentioned in documents"""
+    if not doc_texts:
+        return ""
+        
+    # Look for keywords related to safety
+    safety_keywords = ['safety', 'tolerability', 'adverse', 'side effect', 'contraindication', 'toxicity']
+    relevant_excerpts = []
+    
+    for text in doc_texts:
+        text_lower = text.lower()
+        if any(keyword in text_lower for keyword in safety_keywords):
+            # Find sentences containing keywords
+            import re
+            sentences = re.split(r'[.!?]+', text)
+            for sentence in sentences:
+                if any(keyword in sentence.lower() for keyword in safety_keywords):
+                    relevant_excerpts.append(sentence.strip())
+                    break  # Take first relevant sentence
+    
+    if relevant_excerpts:
+        return "Safety profile indicates " + relevant_excerpts[0][:100] + "..."
+    return ""
+
+def analyze_clinical_trial_data(trials):
+    """Analyze clinical trial data for insights"""
+    if not trials:
+        return ""
+    
+    insights = []
+    for trial in trials[:2]:  # Analyze top 2 trials
+        title = trial.get('title', '')
+        condition = trial.get('condition', 'N/A')
+        phase = trial.get('phase', 'N/A')
+        status = trial.get('status', 'N/A')
+        insights.append(f"Clinical trial '{title}' for {condition} (Phase {phase}, {status}) provides evidence for this intervention.")
+    
+    return " ".join(insights)
+
+def analyze_patent_data(patents):
+    """Analyze patent data for insights"""
+    if not patents:
+        return ""
+    
+    insights = []
+    for patent in patents[:2]:  # Analyze top 2 patents
+        title = patent.get('title', '')
+        assignee = patent.get('assignee', 'Unknown')
+        insights.append(f"Patent '{title}' by {assignee} describes innovative approaches in this field.")
+    
+    return " ".join(insights)
+
+def analyze_web_intelligence(web_data):
+    """Analyze web intelligence for insights"""
+    if not web_data:
+        return ""
+    
+    insights = []
+    for article in web_data[:2]:  # Analyze top 2 articles
+        title = article.get('title', '')
+        source = article.get('source', 'Source')
+        insights.append(f"Recent research '{title}' from {source} contributes to current understanding.")
+    
+    return " ".join(insights)
+
+def provide_general_medical_context(query):
+    """Provide general medical context when specific analysis isn't possible"""
+    return f"Based on medical knowledge, {query} involves complex biological processes that require professional medical evaluation. For specific guidance, consult with qualified healthcare professionals."
 
 if __name__ == '__main__':
     print(f"Starting Pharma Mind Nexus API server on port {PORT}")

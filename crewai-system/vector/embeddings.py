@@ -54,6 +54,27 @@ def get_embedding_model():
         print(f"Error loading embedding model: {str(e)}")
         raise
 
+def embed_text(text, model=None):
+    """
+    Generate embedding for a single text
+    
+    Args:
+        text (str): Text string to embed
+        model (SentenceTransformer): Optional pre-loaded model
+    
+    Returns:
+        list: Embedding vector
+    """
+    try:
+        if model is None:
+            model = get_embedding_model()
+        
+        embedding = model.encode([text])[0].tolist()
+        return embedding
+    except Exception as e:
+        print(f"Error generating embedding: {str(e)}")
+        raise
+
 def embed_texts(texts, model=None):
     """
     Generate embeddings for a list of texts

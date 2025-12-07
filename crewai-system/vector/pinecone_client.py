@@ -3,6 +3,7 @@ Pinecone client for vector operations
 """
 import os
 import pinecone
+from pinecone import Pinecone, ServerlessSpec
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -20,15 +21,23 @@ class PineconeClient:
         if not self.api_key:
             raise ValueError("PINECONE_API_KEY not found in environment variables")
         
-        # Initialize Pinecone
-        pinecone.init(api_key=self.api_key, environment=self.environment)
+        # Initialize Pinecone with the new API
+        self.pc = Pinecone(api_key=self.api_key)
         
         # Create index if it doesn't exist
-        if self.index_name not in pinecone.list_indexes():
+        if self.index_name not in self.pc.list_indexes().names():
             print(f"Creating Pinecone index: {self.index_name}")
-            pinecone.create_index(self.index_name, dimension=384, metric="cosine")
+            self.pc.create_index(
+                name=self.index_name,
+                dimension=384,
+                metric="cosine",
+                spec=ServerlessSpec(
+                    cloud='aws',
+                    region='us-east-1'  # Changed to a region supported by the free plan
+                )
+            )
         
-        self.index = pinecone.Index(self.index_name)
+        self.index = self.pc.Index(self.index_name)
     
     def upsert_vectors(self, vectors):
         """
